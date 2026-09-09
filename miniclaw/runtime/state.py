@@ -38,6 +38,9 @@ class RunState:
     messages: list[Message] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     error: str | None = None
+    # 机器可读的错误类别：model_error / budget_exceeded / deadline_exceeded /
+    # cancelled / runtime_error。error 前缀与之一致，保持人读兼容。
+    error_kind: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     # 已写入 SessionStore 的消息数量，由 ConversationService 维护，
