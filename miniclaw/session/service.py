@@ -28,6 +28,11 @@ class ConversationService:
         self._store = store
         self._runtime = runtime
 
+    @property
+    def runtime(self) -> AgentRuntime | None:
+        """本服务使用的 AgentRuntime（未注入时为 None）。"""
+        return self._runtime
+
     async def chat(
         self, *, tenant_id: str, user_id: str, session_id: str, user_input: str
     ) -> RunState:
