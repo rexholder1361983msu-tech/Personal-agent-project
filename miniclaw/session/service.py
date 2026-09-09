@@ -18,13 +18,31 @@ import asyncio
 import time
 
 from miniclaw.llm.messages import Message
+from miniclaw.runtime.loop import AgentRuntime
 from miniclaw.runtime.state import RunState
 from miniclaw.session.store import SessionStore
 
 
 class ConversationService:
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(self, store: SessionStore, runtime: AgentRuntime | None = None) -> None:
         self._store = store
+        self._runtime = runtime
+
+    async def chat(
+        self, *, tenant_id: str, user_id: str, session_id: str, user_input: str
+    ) -> RunState:
+        """一次完整对话：加载历史 → Runtime 执行 → 持久化。"""
+        if self._runtime is None:
+            raise RuntimeError(
+                "ConversationService requires a runtime for chat(); "
+                "pass it to __init__ or use build_runtime()"
+            )
+        state = await self.load_or_create(
+            tenant_id=tenant_id, user_id=user_id, session_id=session_id
+        )
+        state = await self._runtime.run(state, user_input)
+        await self.save(state)
+        return state
 
     async def load_or_create(
         self, *, tenant_id: str, user_id: str, session_id: str
