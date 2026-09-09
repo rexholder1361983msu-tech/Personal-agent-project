@@ -139,4 +139,8 @@ def build_runtime(config: AgentConfig, *, model=None, store=None) -> RuntimeBund
 ## 7. 执行记录
 
 - 2026-09-09：计划经评审确认；用户将第一个切片定义为"SessionStore + RunState + 会话隔离测试"（调整了原 S0–S6 顺序，Runtime 循环与网关后移）。
-- 2026-09-09：完成骨架（git 两次提交）与第一个切片：`miniclaw/llm/messages.py`、`miniclaw/runtime/state.py`、`miniclaw/session/{store,service}.py`，测试 18 个全部通过（隔离、顺序、重启恢复、多线程写入、幂等保存）。剩余切片：Runtime 循环 + ScriptedModel → 工具协议与内置工具 → build_runtime + CLI/Web/Skill → 验收测试。
+- 2026-09-09：完成骨架（git 两次提交）与第一个切片：`miniclaw/llm/messages.py`、`miniclaw/runtime/state.py`、`miniclaw/session/{store,service}.py`，测试 18 个全部通过（隔离、顺序、重启恢复、多线程写入、幂等保存）。
+- 2026-09-09：切片A 完成——`ModelClient` 协议、`ScriptedModel`、`RunLimits`、轻量事件回调、`AgentRuntime.run()` ReAct 循环、`ConversationService.chat()`（load→run→save），33 个测试。
+- 2026-09-09：切片B 完成——内置安全工具（echo/current_time/calculator，AST 白名单）、高风险工具禁用占位（不做黑名单伪装隔离），42 个测试。
+- 2026-09-09：切片C 完成——`AgentConfig.from_env`、OpenAI-compatible 适配器（httpx，MockTransport 可测）、SKILL.md 解析与 `SkillAsTool`（同一 Runtime、子会话命名空间、防递归）、`build_runtime` 唯一组装入口、FastAPI 网关（三键隔离、租户解析 body>header>default）、CLI（一次性+REPL），72 个测试。
+- 2026-09-09：切片D 完成——`tests/test_acceptance_phase1.py` 逐条映射验收标准（AC1 并发隔离/工具结果隔离、AC2 重启恢复、AC3 CLI/Web/Skill 单一 Runtime 证据链、AC4 工具与失败复现、AC5 零真实 LLM），README 落盘。**第一阶段完成。**
