@@ -135,3 +135,8 @@ def build_runtime(config: AgentConfig, *, model=None, store=None) -> RuntimeBund
 | 真实 MiniClaw 源码稍后放入，与新建骨架冲突 | S3 前是纯新增，冲突面小；届时把 S1–S2 改为对齐现有实现的适配层 |
 | sqlite 并发写（多线程测试） | WAL + 每操作独立连接 + 短事务；测试覆盖交错写入 |
 | async/sync 边界混乱 | 模型与工具协议 async；SessionStore 同步、由 ConversationService 以 `asyncio.to_thread` 封装 |
+
+## 7. 执行记录
+
+- 2026-09-09：计划经评审确认；用户将第一个切片定义为"SessionStore + RunState + 会话隔离测试"（调整了原 S0–S6 顺序，Runtime 循环与网关后移）。
+- 2026-09-09：完成骨架（git 两次提交）与第一个切片：`miniclaw/llm/messages.py`、`miniclaw/runtime/state.py`、`miniclaw/session/{store,service}.py`，测试 18 个全部通过（隔离、顺序、重启恢复、多线程写入、幂等保存）。剩余切片：Runtime 循环 + ScriptedModel → 工具协议与内置工具 → build_runtime + CLI/Web/Skill → 验收测试。
