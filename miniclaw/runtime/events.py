@@ -16,6 +16,7 @@ class RunEventType(str, Enum):
     MODEL_REQUESTED = "model_requested"
     TOOL_CALLED = "tool_called"
     TOOL_RETURNED = "tool_returned"
+    RUN_PAUSED = "run_paused"
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
 
@@ -26,6 +27,10 @@ class RunEvent:
     run_id: str
     step: int
     data: dict[str, Any] = field(default_factory=dict)
+    # 三键在运行时由 _emit 从 RunState 填充；EventStore 落库与按 scope 查询依赖它们。
+    tenant_id: str | None = None
+    user_id: str | None = None
+    session_id: str | None = None
 
 
 EventListener = Callable[[RunEvent], None]

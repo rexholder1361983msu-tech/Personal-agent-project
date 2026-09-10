@@ -16,6 +16,7 @@ from miniclaw.llm.openai_compat import OpenAICompatModel
 from miniclaw.runtime.events import EventListener
 from miniclaw.runtime.limits import RunLimits
 from miniclaw.runtime.loop import AgentRuntime
+from miniclaw.session.event_store import SQLiteEventStore
 from miniclaw.session.service import ConversationService
 from miniclaw.session.store import SessionStore, SQLiteSessionStore
 from miniclaw.skills.loader import load_skills
@@ -34,6 +35,7 @@ class RuntimeBundle:
     runtime: AgentRuntime
     store: SessionStore
     service: ConversationService
+    event_store: SQLiteEventStore | None = None
 
 
 def build_runtime(
@@ -43,6 +45,7 @@ def build_runtime(
     store: SessionStore | None = None,
     skill_dir: str | Path | None = None,
     on_event: EventListener | None = None,
+    event_store: SQLiteEventStore | None = None,
 ) -> RuntimeBundle:
     resolved_model = (
         model
@@ -55,6 +58,26 @@ def build_runtime(
         )
     )
     resolved_store = store if store is not None else SQLiteSessionStore(config.db_path)
+    # 事件持久化默认只对生产组装（未注入 store）开启，与 store 同库不同连接；
+    # 测试注入 store 时保持无事件库，除非显式传入 event_store。
+    resolved_event_store = (
+        event_store
+        if event_store is not None
+        else (None if store is not None else SQLiteEventStore(config.db_path))
+    )
+
+    listeners: list[EventListener] = []
+    if on_event is not None:
+        listeners.append(on_event)
+    if resolved_event_store is not None:
+        listeners.append(resolved_event_store.listener())
+    combined: EventListener | None = None
+    if listeners:
+        registered = tuple(listeners)
+
+        def combined(event, _listeners=registered) -> None:
+            for listener in _listeners:
+                listener(event)
 
     registry = ToolRegistry()
     for tool in default_tools():
@@ -63,7 +86,7 @@ def build_runtime(
         model=resolved_model,
         tools=registry,
         limits=RunLimits(max_steps=config.max_steps),
-        on_event=on_event,
+        on_event=combined,
     )
 
     if skill_dir is not None:
@@ -78,4 +101,5 @@ def build_runtime(
         runtime=runtime,
         store=resolved_store,
         service=service,
+        event_store=resolved_event_store,
     )

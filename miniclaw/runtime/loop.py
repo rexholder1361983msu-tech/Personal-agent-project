@@ -67,7 +67,15 @@ class AgentRuntime:
         if self.on_event is None:
             return
         self.on_event(
-            RunEvent(type=event_type, run_id=state.run_id, step=state.step, data=data)
+            RunEvent(
+                type=event_type,
+                run_id=state.run_id,
+                step=state.step,
+                data=data,
+                tenant_id=state.tenant_id,
+                user_id=state.user_id,
+                session_id=state.session_id,
+            )
         )
 
     async def run(
