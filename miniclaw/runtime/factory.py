@@ -23,8 +23,10 @@ from miniclaw.session.store import SessionStore, SQLiteSessionStore
 from miniclaw.skills.loader import load_skills
 from miniclaw.skills.skill_tool import SkillAsTool
 from miniclaw.tools.builtin import default_tools
-from miniclaw.tools.policy import ToolPolicy
+from miniclaw.tools.executor import LocalSubprocessExecutor
+from miniclaw.tools.policy import ToolMode, ToolPolicy, ToolRule
 from miniclaw.tools.registry import ToolRegistry
+from miniclaw.tools.unsafe import PythonEvalTool, ShellTool
 
 
 @dataclass
@@ -53,6 +55,7 @@ def build_runtime(
     approval_gate: ApprovalGate | None = None,
     tool_policy: ToolPolicy | None = None,
     redact_events: bool = False,
+    enable_shell_tools: bool = False,
 ) -> RuntimeBundle:
     resolved_model = (
         model
@@ -98,13 +101,27 @@ def build_runtime(
     registry = ToolRegistry()
     for tool in default_tools():
         registry.register(tool)
+    resolved_tool_policy = tool_policy
+    if enable_shell_tools:
+        # 本地受限执行器：资源约束不是安全隔离——正因如此默认策略强制审批。
+        # docker 就绪后换成 DockerSandboxExecutor（不可用时构造抛 ToolDisabledError）。
+        executor = LocalSubprocessExecutor()
+        registry.register(ShellTool(executor))
+        registry.register(PythonEvalTool(executor))
+        if resolved_tool_policy is None:
+            resolved_tool_policy = ToolPolicy(
+                {
+                    "shell": ToolRule(mode=ToolMode.NEEDS_APPROVAL),
+                    "python_eval": ToolRule(mode=ToolMode.NEEDS_APPROVAL),
+                }
+            )
     runtime = AgentRuntime(
         model=resolved_model,
         tools=registry,
         limits=RunLimits(max_steps=config.max_steps),
         on_event=combined,
         approval_gate=approval_gate,
-        tool_policy=tool_policy,
+        tool_policy=resolved_tool_policy,
     )
 
     if skill_dir is not None:

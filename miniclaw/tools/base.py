@@ -17,6 +17,10 @@ class ToolContext:
     agent_id: str = "default"
 
 
+class ToolDisabledError(RuntimeError):
+    """工具存在但未启用（未配置执行器 / sandbox 不可用）。"""
+
+
 class Tool(Protocol):
     """工具契约。
 

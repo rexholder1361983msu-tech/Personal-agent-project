@@ -195,6 +195,66 @@ def test_rule_rejects_invalid_constraint_values():
 # ── 组装入口与审计脱敏 ───────────────────────────────────────────────
 
 
+async def test_shell_tools_absent_by_default(db_path):
+    bundle = build_runtime(
+        AgentConfig(), model=ScriptedModel(text_response("x")), store=SQLiteSessionStore(db_path)
+    )
+    assert "shell" not in bundle.tools
+    assert "python_eval" not in bundle.tools
+    bundle.store.close()
+
+
+async def test_enable_shell_tools_forces_default_approval_policy(db_path):
+    model = ScriptedModel(
+        tool_call_response("c1", "python_eval", '{"code": "print(21+21)"}'),
+        text_response("done"),
+    )
+    bundle = build_runtime(
+        AgentConfig(),
+        model=model,
+        store=SQLiteSessionStore(db_path),
+        run_store=SQLiteRunStore(db_path),
+        enable_shell_tools=True,
+    )
+    assert "python_eval" in bundle.tools and "shell" in bundle.tools
+
+    state1 = await bundle.service.chat(
+        tenant_id="t", user_id="u", session_id="s", user_input="calc"
+    )
+    assert state1.status is RunStatus.PAUSED  # 默认策略强制审批：未批准不执行
+
+    state2 = await bundle.service.resume(
+        tenant_id="t", user_id="u", session_id="s", run_id=state1.run_id, approval=True
+    )
+    assert state2.status is RunStatus.COMPLETED
+    tool_msg = next(m for m in state2.messages if m.tool_call_id == "c1")
+    assert tool_msg.content.strip() == "42"  # 真实本地 python 子进程的输出
+    assert final_reply(state2) == "done"
+    bundle.store.close()
+    bundle.run_store.close()
+
+
+async def test_explicit_policy_overrides_enable_default(db_path):
+    model = ScriptedModel(
+        tool_call_response("c1", "python_eval", '{"code": "print(1)"}'), text_response("ok")
+    )
+    bundle = build_runtime(
+        AgentConfig(),
+        model=model,
+        store=SQLiteSessionStore(db_path),
+        enable_shell_tools=True,
+        tool_policy=ToolPolicy({"python_eval": ToolRule(mode=ToolMode.DENY)}),
+    )
+
+    state = await bundle.service.chat(
+        tenant_id="t", user_id="u", session_id="s", user_input="go"
+    )
+
+    assert state.status is RunStatus.COMPLETED  # 显式策略生效：deny 直接拒绝，不暂停
+    assert "not permitted" in state.messages[2].content
+    bundle.store.close()
+
+
 async def test_policy_pauses_via_full_stack_and_resumes(db_path):
     model = ScriptedModel(
         tool_call_response("c1", "echo", '{"text": "hi"}'), text_response("done")
