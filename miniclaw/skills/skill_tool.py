@@ -56,4 +56,7 @@ class SkillAsTool:
         child_state = await runtime.run(child_state, task, tool_names=allowed)
         if child_state.status is RunStatus.FAILED:
             return f"skill_error: {child_state.error}"
+        if child_state.status is RunStatus.PAUSED:
+            # 子运行等待审批时没有终答；如实上报，父运行可决定下一步。
+            return "skill_error: sub-run paused awaiting tool approval"
         return final_reply(child_state) or ""

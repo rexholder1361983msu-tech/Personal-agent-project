@@ -15,8 +15,9 @@ from miniclaw.llm.base import ModelClient
 from miniclaw.llm.openai_compat import OpenAICompatModel
 from miniclaw.runtime.events import EventListener
 from miniclaw.runtime.limits import RunLimits
-from miniclaw.runtime.loop import AgentRuntime
+from miniclaw.runtime.loop import AgentRuntime, ApprovalGate
 from miniclaw.session.event_store import SQLiteEventStore
+from miniclaw.session.run_store import SQLiteRunStore
 from miniclaw.session.service import ConversationService
 from miniclaw.session.store import SessionStore, SQLiteSessionStore
 from miniclaw.skills.loader import load_skills
@@ -36,6 +37,7 @@ class RuntimeBundle:
     store: SessionStore
     service: ConversationService
     event_store: SQLiteEventStore | None = None
+    run_store: SQLiteRunStore | None = None
 
 
 def build_runtime(
@@ -46,6 +48,8 @@ def build_runtime(
     skill_dir: str | Path | None = None,
     on_event: EventListener | None = None,
     event_store: SQLiteEventStore | None = None,
+    run_store: SQLiteRunStore | None = None,
+    approval_gate: ApprovalGate | None = None,
 ) -> RuntimeBundle:
     resolved_model = (
         model
@@ -58,12 +62,17 @@ def build_runtime(
         )
     )
     resolved_store = store if store is not None else SQLiteSessionStore(config.db_path)
-    # 事件持久化默认只对生产组装（未注入 store）开启，与 store 同库不同连接；
-    # 测试注入 store 时保持无事件库，除非显式传入 event_store。
+    # 事件/运行元数据持久化默认只对生产组装（未注入 store）开启，与 store
+    # 同库不同连接；测试注入 store 时保持无附加库，除非显式传入。
     resolved_event_store = (
         event_store
         if event_store is not None
         else (None if store is not None else SQLiteEventStore(config.db_path))
+    )
+    resolved_run_store = (
+        run_store
+        if run_store is not None
+        else (None if store is not None else SQLiteRunStore(config.db_path))
     )
 
     listeners: list[EventListener] = []
@@ -87,13 +96,14 @@ def build_runtime(
         tools=registry,
         limits=RunLimits(max_steps=config.max_steps),
         on_event=combined,
+        approval_gate=approval_gate,
     )
 
     if skill_dir is not None:
         for skill in load_skills(Path(skill_dir)):
             registry.register(SkillAsTool(skill, lambda: runtime))
 
-    service = ConversationService(resolved_store, runtime=runtime)
+    service = ConversationService(resolved_store, runtime=runtime, run_store=resolved_run_store)
     return RuntimeBundle(
         config=config,
         model=resolved_model,
@@ -102,4 +112,5 @@ def build_runtime(
         store=resolved_store,
         service=service,
         event_store=resolved_event_store,
+        run_store=resolved_run_store,
     )

@@ -6,9 +6,20 @@ Runtime 无状态：RunState 显式传入传出，CLI/Web/Skill/后台任务复�
 
 资源与取消检查点（本阶段语义）：
 - 取消（CancelToken）：每次模型请求前、每次工具执行前检查；
-- 截止时间（max_run_duration_s）：同上检查点；
+- 截止时间（max_run_duration_s）：同上检查点；恢复后的运行从恢复时刻重新起算；
 - token 预算（max_total_tokens）：每次累计 usage 后立即检查，即使该响应
   本可作为终答，超预算也判定运行失败（严格语义）。
+
+审批暂停/恢复（P2-C）：
+- approval_gate(name, arguments, context) 返回 True 的工具调用不执行，
+  运行置 PAUSED：pending_approval 记录该调用与同一响应中尚未处理的后续
+  调用（保证恢复后每个 tool_call 都有结果回填）；
+- 恢复：run(state, approval=True/False)（user_input 保持 None，同 run_id），
+  批准则执行挂起的调用后继续；拒绝则以 tool_error 消息回填后继续；
+- 挂起未决时禁止发送新的 user 输入（协议上 tool_call 必须先有结果）；
+- 事件：挂起时发 TOOL_CALLED（沿用 P1 语义，未执行的调用也发）+ RUN_PAUSED，
+  恢复后补 TOOL_RETURNED，跨进程由 EventStore 按 seq 接成一条链；
+  RUN_STARTED 每个 run_id 只发一次（恢复不重发）。
 
 失败语义（error 前缀 / error_kind）：
 - 模型异常 → model_error: …            / model_error
@@ -28,13 +39,16 @@ import time
 from typing import Callable, Collection
 
 from miniclaw.llm.base import ModelClient
-from miniclaw.llm.messages import Message
+from miniclaw.llm.messages import Message, ToolCall
 from miniclaw.runtime.cancel import CancelToken
 from miniclaw.runtime.events import EventListener, RunEvent, RunEventType
 from miniclaw.runtime.limits import RunLimits
 from miniclaw.runtime.state import RunState, RunStatus
 from miniclaw.tools.base import ToolContext
 from miniclaw.tools.registry import ToolRegistry
+
+# (tool_name, arguments_json, context) -> 该调用是否需要人工审批
+ApprovalGate = Callable[[str, str, ToolContext], bool]
 
 
 def final_reply(state: RunState) -> str | None:
@@ -56,11 +70,13 @@ class AgentRuntime:
         on_event: EventListener | None = None,
         *,
         clock: Callable[[], float] | None = None,
+        approval_gate: ApprovalGate | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
         self.limits = limits or RunLimits()
         self.on_event = on_event
+        self.approval_gate = approval_gate
         self._clock = clock or time.monotonic
 
     def _emit(self, state: RunState, event_type: RunEventType, **data) -> None:
@@ -85,16 +101,32 @@ class AgentRuntime:
         *,
         tool_names: Collection[str] | None = None,
         cancel: CancelToken | None = None,
+        approval: bool | None = None,
     ) -> RunState:
         """执行一次运行。
 
-        user_input 非空时作为 user 消息追加；为 None 时基于已有消息继续
-        （为暂停/恢复预留）。tool_names 限定本次运行可见的工具
-        （技能子运行用它排除其他技能，防止递归）。cancel 为协作式取消令牌，
-        在检查点响应，不做抢占。
+        user_input 非空时作为 user 消息追加；为 None 时基于已有消息继续。
+        tool_names 限定本次运行可见的工具（技能子运行用它排除其他技能，
+        防止递归）。cancel 为协作式取消令牌，在检查点响应，不做抢占。
+
+        审批恢复：state.pending_approval 非空时，approval 必须给出
+        （True 执行挂起的调用，False 以 tool_error 回填），user_input 必须为
+        None；step/usage/tool_calls_used 沿用传入状态，run_id 不变。
         """
         if user_input is None and not state.messages:
             raise ValueError("user_input is required to start a run")
+        if state.pending_approval is not None:
+            if user_input is not None:
+                raise ValueError(
+                    "a tool call is awaiting approval; resolve it with run(state, approval=...) first"
+                )
+            if approval is None:
+                raise ValueError(
+                    "approval decision (True/False) is required to resume a paused run"
+                )
+        elif approval is not None:
+            raise ValueError("approval decision given but no tool call is awaiting approval")
+        pending = state.pending_approval
         allowed = set(tool_names) if tool_names is not None else None
         specs = (
             self.tools.specs()
@@ -102,6 +134,13 @@ class AgentRuntime:
             else [s for s in self.tools.specs() if s.name in allowed]
         )
         started = self._clock()
+        context = ToolContext(
+            tenant_id=state.tenant_id,
+            user_id=state.user_id,
+            session_id=state.session_id,
+            run_id=state.run_id,
+            agent_id=state.agent_id,
+        )
 
         state.status = RunStatus.RUNNING
         state.error = None
@@ -109,9 +148,31 @@ class AgentRuntime:
         state.updated_at = time.time()
         if user_input is not None:
             state.messages.append(Message(role="user", content=user_input))
-        self._emit(state, RunEventType.RUN_STARTED)
+        if pending is None:
+            # RUN_STARTED 每个 run_id 只发一次；恢复运行不重发。
+            self._emit(state, RunEventType.RUN_STARTED)
 
         try:
+            if pending is not None:
+                state.pending_approval = None
+                head = ToolCall(
+                    id=pending["call"]["id"],
+                    name=pending["call"]["name"],
+                    arguments=pending["call"].get("arguments", "{}"),
+                )
+                remaining = [
+                    ToolCall(id=c["id"], name=c["name"], arguments=c.get("arguments", "{}"))
+                    for c in pending.get("remaining", [])
+                ]
+                if (failure := self._check_guards(state, cancel, started)) is not None:
+                    return failure
+                await self._resolve_pending(state, head, context, approval)
+                outcome = await self._process_calls(
+                    state, remaining, context, allowed, cancel, started
+                )
+                if outcome != "done":
+                    return state
+
             while True:
                 if (failure := self._check_guards(state, cancel, started)) is not None:
                     return failure
@@ -148,57 +209,119 @@ class AgentRuntime:
                     self._emit(state, RunEventType.RUN_COMPLETED, steps=state.step)
                     return state
 
-                context = ToolContext(
-                    tenant_id=state.tenant_id,
-                    user_id=state.user_id,
-                    session_id=state.session_id,
-                    run_id=state.run_id,
-                    agent_id=state.agent_id,
+                outcome = await self._process_calls(
+                    state, calls, context, allowed, cancel, started
                 )
-                for call in calls:
-                    if state.tool_calls_used >= self.limits.max_tool_calls:
-                        return self._fail(
-                            state,
-                            f"max_tool_calls_exceeded: limit is {self.limits.max_tool_calls}",
-                            "budget_exceeded",
-                        )
-                    if (failure := self._check_guards(state, cancel, started)) is not None:
-                        return failure
-                    state.tool_calls_used += 1
-                    self._emit(
-                        state,
-                        RunEventType.TOOL_CALLED,
-                        name=call.name,
-                        call_id=call.id,
-                        arguments=call.arguments,
-                    )
-                    if allowed is not None and call.name not in allowed:
-                        content, ok = (
-                            f"tool_error: tool '{call.name}' is not allowed in this context",
-                            False,
-                        )
-                    else:
-                        tool = self.tools.get(call.name)
-                        if tool is None:
-                            content, ok = (
-                                f"tool_error: unknown tool '{call.name}'",
-                                False,
-                            )
-                        else:
-                            content, ok = await self._execute_tool(tool, call, context)
-                    self._emit(
-                        state,
-                        RunEventType.TOOL_RETURNED,
-                        name=call.name,
-                        call_id=call.id,
-                        ok=ok,
-                        content=content,
-                    )
-                    state.messages.append(
-                        Message(role="tool", content=content, tool_call_id=call.id)
-                    )
+                if outcome != "done":
+                    return state
         except Exception as exc:  # 防御性兜底：未预期异常落成结构化失败
             return self._fail(state, f"runtime_error: {type(exc).__name__}: {exc}", "runtime_error")
+
+    async def _process_calls(
+        self,
+        state: RunState,
+        calls: list[ToolCall],
+        context: ToolContext,
+        allowed: set[str] | None,
+        cancel: CancelToken | None,
+        started: float,
+    ) -> str:
+        """依次处理一批工具调用。
+
+        返回 "done"（全部处理完）或 "paused"/"failed"——后两种情况下 state
+        已置为 PAUSED/FAILED，调用方应直接返回。暂停时 pending_approval
+        记录待审批调用与同一响应中尚未处理的后续调用。
+        """
+        for index, call in enumerate(calls):
+            if state.tool_calls_used >= self.limits.max_tool_calls:
+                self._fail(
+                    state,
+                    f"max_tool_calls_exceeded: limit is {self.limits.max_tool_calls}",
+                    "budget_exceeded",
+                )
+                return "failed"
+            if (failure := self._check_guards(state, cancel, started)) is not None:
+                return "failed"
+            state.tool_calls_used += 1
+            self._emit(
+                state,
+                RunEventType.TOOL_CALLED,
+                name=call.name,
+                call_id=call.id,
+                arguments=call.arguments,
+            )
+            if allowed is not None and call.name not in allowed:
+                content, ok = (
+                    f"tool_error: tool '{call.name}' is not allowed in this context",
+                    False,
+                )
+            elif (tool := self.tools.get(call.name)) is None:
+                content, ok = (
+                    f"tool_error: unknown tool '{call.name}'",
+                    False,
+                )
+            elif self.approval_gate is not None and self.approval_gate(
+                call.name, call.arguments, context
+            ):
+                state.pending_approval = {
+                    "call": {"id": call.id, "name": call.name, "arguments": call.arguments},
+                    "remaining": [
+                        {"id": c.id, "name": c.name, "arguments": c.arguments}
+                        for c in calls[index + 1 :]
+                    ],
+                }
+                state.status = RunStatus.PAUSED
+                state.updated_at = time.time()
+                self._emit(
+                    state,
+                    RunEventType.RUN_PAUSED,
+                    name=call.name,
+                    call_id=call.id,
+                    arguments=call.arguments,
+                )
+                return "paused"
+            else:
+                content, ok = await self._execute_tool(tool, call, context)
+            self._emit(
+                state,
+                RunEventType.TOOL_RETURNED,
+                name=call.name,
+                call_id=call.id,
+                ok=ok,
+                content=content,
+            )
+            state.messages.append(
+                Message(role="tool", content=content, tool_call_id=call.id)
+            )
+        return "done"
+
+    async def _resolve_pending(
+        self, state: RunState, head: ToolCall, context: ToolContext, approval: bool
+    ) -> None:
+        """恢复时处理挂起的审批调用：批准则执行，拒绝则回填 tool_error。
+
+        TOOL_CALLED 已在挂起时发出（每次调用只发一次），此处只补
+        TOOL_RETURNED；EventStore 按 run_id + seq 把跨进程的两段接成一条链。
+        """
+        if approval:
+            tool = self.tools.get(head.name)
+            if tool is None:
+                content, ok = (f"tool_error: unknown tool '{head.name}'", False)
+            else:
+                content, ok = await self._execute_tool(tool, head, context)
+        else:
+            content, ok = (f"tool_error: tool '{head.name}' was not approved", False)
+        self._emit(
+            state,
+            RunEventType.TOOL_RETURNED,
+            name=head.name,
+            call_id=head.id,
+            ok=ok,
+            content=content,
+        )
+        state.messages.append(
+            Message(role="tool", content=content, tool_call_id=head.id)
+        )
 
     def _check_guards(
         self, state: RunState, cancel: CancelToken | None, started: float
