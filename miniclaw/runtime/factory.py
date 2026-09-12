@@ -23,6 +23,7 @@ from miniclaw.session.store import SessionStore, SQLiteSessionStore
 from miniclaw.skills.loader import load_skills
 from miniclaw.skills.skill_tool import SkillAsTool
 from miniclaw.tools.builtin import default_tools
+from miniclaw.tools.policy import ToolPolicy
 from miniclaw.tools.registry import ToolRegistry
 
 
@@ -50,6 +51,8 @@ def build_runtime(
     event_store: SQLiteEventStore | None = None,
     run_store: SQLiteRunStore | None = None,
     approval_gate: ApprovalGate | None = None,
+    tool_policy: ToolPolicy | None = None,
+    redact_events: bool = False,
 ) -> RuntimeBundle:
     resolved_model = (
         model
@@ -67,7 +70,11 @@ def build_runtime(
     resolved_event_store = (
         event_store
         if event_store is not None
-        else (None if store is not None else SQLiteEventStore(config.db_path))
+        else (
+            None
+            if store is not None
+            else SQLiteEventStore(config.db_path, redact=redact_events)
+        )
     )
     resolved_run_store = (
         run_store
@@ -97,6 +104,7 @@ def build_runtime(
         limits=RunLimits(max_steps=config.max_steps),
         on_event=combined,
         approval_gate=approval_gate,
+        tool_policy=tool_policy,
     )
 
     if skill_dir is not None:

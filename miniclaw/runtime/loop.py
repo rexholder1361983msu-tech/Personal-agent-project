@@ -21,6 +21,13 @@ Runtime 无状态：RunState 显式传入传出，CLI/Web/Skill/后台任务复�
   恢复后补 TOOL_RETURNED，跨进程由 EventStore 按 seq 接成一条链；
   RUN_STARTED 每个 run_id 只发一次（恢复不重发）。
 
+工具策略（P2-D）：
+- tool_policy 按工具名声明 mode：deny → tool_error 回填、一次都不执行；
+  needs_approval → 与 approval_gate 任一命中即走暂停路径，deny 分支优先短路；
+- 规则级 timeout_s / output_limit 覆盖全局默认（超时取更严格者），截断结果
+  追加 ...[truncated] 标记；恢复执行的挂起调用沿用执行约束，但不重判 mode
+  （审批决定已做出）。
+
 失败语义（error 前缀 / error_kind）：
 - 模型异常 → model_error: …            / model_error
 - 步数、工具次数、token 超限 → …exceeded: … / budget_exceeded
@@ -45,6 +52,7 @@ from miniclaw.runtime.events import EventListener, RunEvent, RunEventType
 from miniclaw.runtime.limits import RunLimits
 from miniclaw.runtime.state import RunState, RunStatus
 from miniclaw.tools.base import ToolContext
+from miniclaw.tools.policy import ToolMode, ToolPolicy, ToolRule
 from miniclaw.tools.registry import ToolRegistry
 
 # (tool_name, arguments_json, context) -> 该调用是否需要人工审批
@@ -71,12 +79,14 @@ class AgentRuntime:
         *,
         clock: Callable[[], float] | None = None,
         approval_gate: ApprovalGate | None = None,
+        tool_policy: ToolPolicy | None = None,
     ) -> None:
         self.model = model
         self.tools = tools
         self.limits = limits or RunLimits()
         self.on_event = on_event
         self.approval_gate = approval_gate
+        self.tool_policy = tool_policy
         self._clock = clock or time.monotonic
 
     def _emit(self, state: RunState, event_type: RunEventType, **data) -> None:
@@ -260,9 +270,12 @@ class AgentRuntime:
                     f"tool_error: unknown tool '{call.name}'",
                     False,
                 )
-            elif self.approval_gate is not None and self.approval_gate(
-                call.name, call.arguments, context
-            ):
+            elif self._is_denied(call.name):
+                content, ok = (
+                    f"tool_error: tool '{call.name}' is not permitted",
+                    False,
+                )
+            elif self._needs_approval(call, context):
                 state.pending_approval = {
                     "call": {"id": call.id, "name": call.name, "arguments": call.arguments},
                     "remaining": [
@@ -281,7 +294,9 @@ class AgentRuntime:
                 )
                 return "paused"
             else:
-                content, ok = await self._execute_tool(tool, call, context)
+                content, ok = await self._execute_tool(
+                    tool, call, context, self._rule_for(call.name)
+                )
             self._emit(
                 state,
                 RunEventType.TOOL_RETURNED,
@@ -302,13 +317,17 @@ class AgentRuntime:
 
         TOOL_CALLED 已在挂起时发出（每次调用只发一次），此处只补
         TOOL_RETURNED；EventStore 按 run_id + seq 把跨进程的两段接成一条链。
+        审批决定已做出，不重判 policy mode；规则级执行约束
+        （timeout/output_limit）仍然生效。
         """
         if approval:
             tool = self.tools.get(head.name)
             if tool is None:
                 content, ok = (f"tool_error: unknown tool '{head.name}'", False)
             else:
-                content, ok = await self._execute_tool(tool, head, context)
+                content, ok = await self._execute_tool(
+                    tool, head, context, self._rule_for(head.name)
+                )
         else:
             content, ok = (f"tool_error: tool '{head.name}' was not approved", False)
         self._emit(
@@ -340,7 +359,33 @@ class AgentRuntime:
                 )
         return None
 
-    async def _execute_tool(self, tool, call, context: ToolContext) -> tuple[str, bool]:
+    def _is_denied(self, name: str) -> bool:
+        return (
+            self.tool_policy is not None and self.tool_policy.decide(name) is ToolMode.DENY
+        )
+
+    def _needs_approval(self, call: ToolCall, context: ToolContext) -> bool:
+        """policy 与 approval_gate 任一判定需审批即暂停（deny 已在更早分支短路）。"""
+        if (
+            self.tool_policy is not None
+            and self.tool_policy.decide(call.name) is ToolMode.NEEDS_APPROVAL
+        ):
+            return True
+        return self.approval_gate is not None and self.approval_gate(
+            call.name, call.arguments, context
+        )
+
+    def _rule_for(self, name: str) -> ToolRule | None:
+        return self.tool_policy.rule_for(name) if self.tool_policy is not None else None
+
+    async def _execute_tool(
+        self, tool, call, context: ToolContext, rule: ToolRule | None = None
+    ) -> tuple[str, bool]:
+        timeout = (
+            rule.effective_timeout(self.limits.tool_timeout_s)
+            if rule is not None
+            else self.limits.tool_timeout_s
+        )
         try:
             try:
                 arguments = json.loads(call.arguments) if call.arguments else {}
@@ -349,11 +394,14 @@ class AgentRuntime:
             if not isinstance(arguments, dict):
                 return "tool_error: arguments must be a JSON object", False
             result = await asyncio.wait_for(
-                tool.execute(arguments, context), timeout=self.limits.tool_timeout_s
+                tool.execute(arguments, context), timeout=timeout
             )
-            return result if isinstance(result, str) else str(result), True
+            content = result if isinstance(result, str) else str(result)
+            if rule is not None:
+                content = rule.truncate(content)
+            return content, True
         except asyncio.TimeoutError:
-            return f"tool_error: timeout after {self.limits.tool_timeout_s}s", False
+            return f"tool_error: timeout after {timeout}s", False
         except Exception as exc:
             return f"tool_error: {type(exc).__name__}: {exc}", False
 
